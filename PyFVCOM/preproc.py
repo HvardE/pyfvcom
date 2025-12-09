@@ -14,10 +14,12 @@ Pierre Cazenave (Plymouth Marine Laboratory)
 import copy
 import inspect
 import multiprocessing
+import os
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from warnings import warn
+from time import gmtime, strftime
 
 import numpy as np
 import scipy.optimize
@@ -33,11 +35,16 @@ from PyFVCOM.read import FileReader, _TimeReader, control_volumes
 from PyFVCOM.utilities.general import flatten_list, PassiveStore, warn
 from PyFVCOM.utilities.time import date_range
 from dateutil.relativedelta import relativedelta
+
 #from matplotlib.dates import num2date, date2num
 from netCDF4 import Dataset, stringtochar, num2date, date2num
 from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import Delaunay
 from shapely.geometry import Polygon
+
+# To extrapolate to the nearest ocean point
+from numba import njit
+from pykdtree.kdtree import KDTree
 
 class Model(Domain):
     """
@@ -204,9 +211,7 @@ class Model(Domain):
     def _add_time(self):
         """
         Add time variables we might need for the various bits of processing.
-
         """
-
         self.time.datetime = date_range(self.start, self.end, inc=self.sampling)
         self.time.time = date2num(getattr(self.time, 'datetime'), units=self._mjd_origin)
         self.time.Itime = np.floor(getattr(self.time, 'time'))  # integer Modified Julian Days
@@ -278,20 +283,25 @@ class Model(Domain):
         distribution to the Model object.
 
         """
-
-        # Add the sigma data to any open boundaries we've got loaded.
+        # Copy the sigma data to any open boundaries we've loaded.
         for boundary in self.open_boundaries:
             for attribute in self.sigma:
-                try:
-                    # Ignore element-based data for now.
-                    if 'center' not in attribute:
-                        setattr(boundary.sigma, attribute, getattr(
-                                self.sigma, attribute)[boundary.nodes, ...])
-                except (IndexError, TypeError):
-                    setattr(boundary.sigma, attribute, getattr(
-                            self.sigma, attribute))
-                except AttributeError:
-                    pass
+                if type(getattr(self.sigma, attribute)) is str:
+                    setattr(boundary.sigma, attribute, getattr(self.sigma, attribute))
+                    continue
+                    
+                if 'center' not in attribute:
+                    # Node based data
+                    setattr(
+                        boundary.sigma, attribute, 
+                        getattr(self.sigma, attribute)[boundary.nodes, ...]
+                        )
+                else:
+                    # Element based data
+                    setattr(
+                        boundary.sigma, attribute, 
+                        getattr(self.sigma, attribute)[boundary.elements, ...]
+                        )
 
     def estimate_time_step(self, maximum_speed, maximum_elevation):
         """
@@ -2487,8 +2497,7 @@ class Model(Domain):
                 for boundary in self.open_boundaries]))
         nest_elements = np.array([], dtype=int)
         #nest_elements = np.array(flatten_list([boundary.elements 
-                #for boundary in self.open_boundaries 
-                #if np.any(boundary.elements)]))
+        #        for boundary in self.open_boundaries]))
 
         if len(self.open_boundaries) == 0:
             raise AttributeError('No open boundaries on which to add nests')
@@ -2511,10 +2520,10 @@ class Model(Domain):
                         nest_nodes, nest_elements)
                 nest_nodes = np.append(nest_nodes, flatten_list(
                         self.open_boundaries[i].nest[-1].nodes))
+                
                 # Note elements are not in new nest level
                 if np.any(self.open_boundaries[i].nest[-2].elements):
-                    nest_elements = np.append(nest_elements, flatten_list(
-                            self.open_boundaries[i].nest[-2].elements))
+                    nest_elements = np.append(nest_elements, flatten_list(self.open_boundaries[i].nest[-2].elements))
 
                 # Find missing elements on the last-but-one nested boundary. 
                 # These are defined as those whose the three nodes are included 
@@ -2525,7 +2534,7 @@ class Model(Domain):
                 # Only apply to the last iteration otherwise you risk ending up
                 # with elements in more than one nest
 
-                if j == self.dims.nest_levels -1:
+                if j == self.dims.nest_levels - 1:
                     boundary_nodes = self.open_boundaries[i].nest[-1].nodes
                     boundary_elements = self.open_boundaries[i].nest[-2].elements
                     missing_elements = np.argwhere(np.all(np.isin(
@@ -3191,8 +3200,7 @@ class Model(Domain):
                             continue
 
                         if adjust_tides is not None and var in adjust_tides:
-                            boundary_data = boundary_data + getattr(
-                                    nest.tide, var)
+                            boundary_data = boundary_data + getattr(nest.tide, var)
 
                         if verbose:
                             print('Process {} for writing '.format(var)
@@ -3860,7 +3868,6 @@ class Model(Domain):
         WriteForcing.add_variable.
 
         """
-
         nodes = np.asarray(flatten_list([boundary.nodes for boundary in self.open_boundaries]))
         time_number = len(self.time.datetime)
         nodes_number = len(nodes)
@@ -3987,7 +3994,187 @@ class Model(Domain):
                         # transpose for writing out.
                         dump[..., temp_nodes_index] = getattr(boundary.data, name).T
                     ncfile.add_variable(name, dump, ['time', 'siglay', 'nobc'], attributes=atts, ncopts=ncopts)
+    
+    def add_surface_forcing(
+            self, fvcom_name, coarse_name, coarse,
+            mode = None, 
+            verbose=False,
+            outfile = 'atmforcing.nc'
+            ):
+        """
+        Interpolate the surface data fields to the grid from 
+        'self.time.start' to 'self.time.end'.
 
+        Parameters
+        ----------
+        fvcom_name : str
+            The data field name to add to the nest object which will be 
+            written to netCDF for FVCOM.
+        coarse_name : str
+            The data field name to use from the coarse object.
+        coarse : RegularReader
+            The regularly gridded data to interpolate onto the open boundary 
+            nodes. This must include time, lon and lat as well as 
+            the time series to interpolate (3D volume [time, lat, lon]).
+        mode : str
+            Set to 'nodes' to interpolate onto node positions or 'elements' for the elements.
+            add_surface_forcing will automatically parse these as "surface_nodes" or "surface_elements"
+            to the regular grid interpolator.
+        outfile : str
+            Name of the output file we're writing data to. This file has to be created __before__ running
+            add_surface_forcing, since it is too memory intensive to keep a full forcing file in memory
+            on many computers.
+            
+
+        Optional parameters:
+        ---
+        verbose : bool
+            Set to True to enable verbose output. Defaults to False 
+            (no verbose output).
+        
+        Inherited from class:
+        ----
+        start time, stop time, sampling frequency
+        """
+        # Check that we know where to interpolate to
+        if not mode:
+            raise ValueError('You need to specify if are interpolating to elements or nodes')
+
+        if not '.nc' in outfile[-3:]:
+            raise ValueError(f'the file {outfile} is not a .nc file')
+
+        # Check that the netCDF forcing file exists
+        if not os.path.isfile(outfile):
+            raise ValueError(f'{outfile} does not exist. Run .create_surface_forcing_file(ncfile = {outfile})')
+
+        # Interpolate data to the forcing file
+        interp_data = interpolate_regular(
+            self, fvcom_name, coarse_name, coarse,
+            interval = self.sampling, 
+            mode = f'surface_{mode}', 
+            verbose=verbose
+            )
+        
+        # Write forcing data to the netCDF file
+        self.write_to_nc(outfile, fvcom_name, interp_data)
+
+    def create_surface_forcing_file(self, ncfile, format = 'NETCDF4', precision = 'f4', **kwargs):
+        '''
+        Write a forcing file for atmospheric data
+        
+        :param ncfile:    name of the netCDF file
+        :param format:    netCDF format, defaults to netCDF4, optional
+        :param precision: 'f4' by default,
+        
+        Any other keyword arguments will be passed on to netCDF4.Dataset
+        '''
+        print(f'Creating {ncfile}, which prescribes surface forcing in a FVCOM readable format.')
+        if not '.nc' in ncfile[-3:]:
+            raise ValueError(f'the file {ncfile} is not a .nc file')
+        
+        ncopts = {}
+        if 'ncopts' in kwargs:
+            ncopts = kwargs['ncopts']
+            kwargs.pop('ncopts')
+
+        # Define the global attributes
+        globals = {
+            f'title': 'FVCOM forcing file',
+            'source': 'FVCOM grid (unstructured) surface forcing',
+            'history': f'File created using {inspect.stack()[0][3]} from PyFVCOM',
+            'created': f'Created {strftime("%Y-%m-%d %H:%M:%S", gmtime())}',
+            'Conventions': 'CF-1.0'
+            }
+
+        dims = {
+            'nele': len(self.grid.xc), 
+            'node': len(self.grid.x), 
+            'time': None, 
+            'DateStrLen': 26, 
+            'three': 3
+            }
+        
+        with WriteForcing(ncfile, dims, global_attributes=globals, clobber=True, format=format, **kwargs) as atmfile:
+            atmfile.write_fvcom_time(self.time.datetime, ncopts = ncopts)
+            lons = {'units': 'degrees_north', 'standard_name': 'latitude'}
+            lats = {'units': 'degrees_east', 'standard_name': 'longitude'}
+            
+            print('Adding grid variables to netCDF')
+            for g in ['x', 'y']:
+                atts = {'units': 'meters', 'long_name': f'nodal {g}-coordinate'}
+                atmfile.add_variable(g, self.grid.x, ['node'], attributes=atts, ncopts=ncopts)
+
+            atts = {'long_name': 'nodal longitude'} | lons
+            atmfile.add_variable('lon', self.grid.lon, ['node'], attributes=atts, ncopts=ncopts)
+
+            atts = {'long_name': 'nodal latitude'} | lats
+            atmfile.add_variable('lat', self.grid.lat, ['node'], attributes=atts, ncopts=ncopts)
+
+            for g in ['xc', 'yc']:
+                atts = {'units': 'meters', 'long_name': f'zonal {g.split("c")[0]}-coordinate'}
+                atmfile.add_variable(g, getattr(self.grid, g), ['nele'], attributes=atts, ncopts=ncopts)
+
+            atts = {'long_name': 'zonal longitude'} | lons
+            atmfile.add_variable('lonc', self.grid.lonc, ['nele'], attributes=atts, ncopts=ncopts)
+
+            atts = {'long_name': 'zonal latitude'} | lats
+            atmfile.add_variable('latc', self.grid.latc, ['nele'], attributes=atts, ncopts=ncopts)
+
+            atts = {'long_name': 'nodes surrounding element'}
+            atmfile.add_variable('nv', self.grid.nv, ['three', 'nele'], format='i4', attributes=atts, ncopts=ncopts)
+
+            print('Define which surface forcing we will dump to the netCDF')
+            atts = {
+                'precip': {
+                    'long_name': 'Precipitation',
+                    'description': 'Precipitation, ocean lose water if negative',
+                    'units': 'm s-1', 
+                    'positive': 'up'
+                    },
+                'evap': {
+                    'long_name': 'Evaporation',
+                    'description': 'Evaporation, ocean lose water is negative',
+                    'units': 'm s-1', 
+                    'positive': 'up'
+                    },
+                'relative_humidity': {'long_name': 'Relative Humidity', 'units': '%'},
+                'SPQ': {'long_name': 'Specific Humidity', 'units': 'kg/kg'},
+                'long_wave': {'long_name': 'Long Wave Radiation', 'units': 'W m-2'},
+                'short_wave': {'long_name': 'Short Wave Radiation', 'units': 'W m-2'},
+                'cloud_cover': {'long_name': 'Cloud Area Fraction', 'units': 'cloud covered fraction of sky [0,1]'},
+                'air_pressure': {'long_name': 'Surface Air Pressure', 'units': 'Pa'},
+                'air_temperature': {'long_name': 'Sea Surface Air Temperature', 'units': 'Degree (C)'},
+                'uwind_speed': {'long_name': 'Eastward Wind Speed', 'units': 'm/s'},
+                'vwind_speed': {'long_name': 'Eastward Wind Speed', 'units': 'm/s'},
+            }
+
+            # Add grid identifier metadata to the netCDF file
+            elemdata = ['uwind_speed', 'vwind_speed']
+            template = {
+                'grid': 'fvcom_grd',
+                'coordinates': '',
+                'type': 'data'
+            }
+            for attr in atts:
+                if attr in elemdata:
+                    loc = {'location': 'nele'}
+                else:
+                    loc = {'location': 'node'}
+                atts[attr] = atts[attr] | template | loc
+
+            # Loop over all attributes and add variables to the netCDF file
+            for attr in atts:
+                print(f'  - Adding {attr} to the surface forcing file')
+                var = atmfile.nc.createVariable(attr, precision, ['time', atts[attr]['location']], **ncopts)
+                for attribute in atts[attr]:
+                    setattr(var, attribute, atts[attr][attribute])
+    
+    def write_to_nc(self, outfile, fvcom_name, interp_data):
+        '''
+        Write interpolated data to the netCDF forcing file
+        '''
+        with Dataset(outfile, 'r+') as forcing:
+            forcing[fvcom_name][:] = interp_data
 
 class NameListEntry(object):
 
@@ -6538,6 +6725,89 @@ class Restart(FileReader):
         self.sigma.layers_center_z = self.grid.siglay_center_z.T
         self.sigma.levels_z = self.grid.siglev_z.T
         self.sigma.levels_center_z = self.grid.siglev_center_z.T
+
+    def extrapolate_to_ocean(self):
+        '''
+        When interpolating from regular data, it is possible to end up in a situation where you have
+        interpoalted nans to the FVCOM grid. This will crash the model, so we need to replace these
+        invalid values with valid ones.
+
+        Say you have interpolated data from another model to FVCOM, and you now have Nan values in your data.
+        This routine will then identify nans, and replace them naïvely with the nearest FVCOM ocean point in the
+        horizontal and vertical.
+
+        .data should be nan free after you have called this routine.
+        '''
+        for this_fvcom, in self.data.keys():
+            data = getattr(self.data, this_fvcom)
+            
+            # Fill land points with ocean data
+            land_points, nearest_ocean_index = self._horizontal_extrapolate(data[0, 0, :])
+            data[0, 0, :, land_points] = data[0, 0, :, nearest_ocean_index]
+
+            # Fill invalid bottom data with the next valid sigma data
+            data[0, 0, :] = self._vertical_extrapolate(data[0, 0, :])
+            setattr(self.data, this_fvcom, data)
+
+    def _horizontal_extrapolate(self, data):
+        '''
+        Reads data (sigma, horizontal) and an FVCOM_grid object.
+        Returns the points that are on land, and their nearest ocean point.
+        '''
+        # Switch to deal with 3D and 2D data
+        if len(data.shape) > 1:
+            # Index reference list. Let index = -1 mean that we are on land.
+            _depthinds = np.tile(np.arange(0, data.shape[0])[:, None], (1, data.shape[1]))
+            _depthinds[np.isnan(data)] = -1
+
+            # Figure out where the lowest (in the water column) sigma layer is.
+            _deepest_valid = np.max(_depthinds, axis = 0)
+
+            # If the lowest possible is not available, then we know that the point is entirely on land.
+            land_points = np.where(_deepest_valid == -1)[0]
+        else:
+            # This is simpler for the 2D case, land is where the nans are.
+            land_points = np.where(np.isnan(data))[0]
+
+        # See if we're dealing with node or cell data
+        if len(data[0,:]) == len(self.grid.x):
+            x, y = self.grid.x, self.grid.y
+        else:
+            x, y = self.grid.xc, self.grid.yc
+        
+        # The ocean nodes are the indices that are not land
+        ocean_point = np.array(
+            list(
+                set(range(x.shape[0])) - set(land_points.tolist())
+                )
+            )
+        
+        # Build a KDTree for ocean points
+        ocean_tree = KDTree(
+            np.array([x[ocean_point], y[ocean_point]]).T
+        )
+        
+        # Find the nearest ocean point to each land point
+        _, nearest_ocean = ocean_tree.query(
+            np.array([x[land_points], y[land_points]]).T
+        )
+
+        # And return the global index for land and ocean points
+        return land_points, ocean_point[nearest_ocean]
+    
+    # We also need to do a vertial extrapolation, since the solid earth sometimes only cover parts of the water column
+    @staticmethod
+    @njit
+    def _vertical_extrapolate(data):
+        '''
+        Use the nearest valid data
+        '''
+        # List the vertical and horizontal position of each nan (vnan increases from 0 ->)
+        vnan, hnan = np.where(np.isnan(data))
+        for v, h in zip(vnan, hnan):
+            # The closest valid data is the data above *this* sigma.
+            data[v, h] = data[v-1, h]
+        return data 
 
     def replace_variable(self, variable, data):
         """

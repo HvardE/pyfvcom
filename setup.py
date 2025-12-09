@@ -1,6 +1,6 @@
 from setuptools import setup
 
-version = '2.2.0'
+version = '2.3.0'
 
 setup(
     name='PyFVCOM',
@@ -16,6 +16,7 @@ setup(
     license='MIT',
     platforms='any',
     install_requires=['jdcal', 'lxml', 'matplotlib', 'netCDF4', 'networkx', 'numpy>=1.13.0', 'pandas', 'xlsxwriter',
-                      'pyproj', 'pytz', 'scipy', 'pyshp', 'UTide', 'shapely', 'descartes', 'cartopy', 'cmocean'],
+                      'pyproj', 'pytz', 'scipy', 'pyshp', 'UTide', 'shapely', 'descartes', 'cartopy', 'cmocean',
+                      'metpy', 'numba', 'cdsapi', 'pykdtree'],
     classifiers=[]
 )
