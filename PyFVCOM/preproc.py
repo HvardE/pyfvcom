@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from warnings import warn
-from time import gmtime, strftime
 
 import numpy as np
 import scipy.optimize
@@ -42,9 +41,10 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import Delaunay
 from shapely.geometry import Polygon
 
-# To extrapolate to the nearest ocean point
+# To extrapolate to the nearest ocean point and work with atmospheric data
 from numba import njit
 from pykdtree.kdtree import KDTree
+from time import gmtime, strftime
 
 class Model(Domain):
     """
@@ -4056,7 +4056,7 @@ class Model(Domain):
             )
         
         # Write forcing data to the netCDF file
-        self.write_to_nc(outfile, fvcom_name, interp_data)
+        self._write_atmosphere_to_nc(outfile, fvcom_name, interp_data)
 
     def create_surface_forcing_file(self, ncfile, format = 'NETCDF4', precision = 'f4', **kwargs):
         '''
@@ -4068,7 +4068,7 @@ class Model(Domain):
         
         Any other keyword arguments will be passed on to netCDF4.Dataset
         '''
-        print(f'Creating {ncfile}, which prescribes surface forcing in a FVCOM readable format.')
+        print(f'Creating {ncfile}')
         if not '.nc' in ncfile[-3:]:
             raise ValueError(f'the file {ncfile} is not a .nc file')
         
@@ -4138,7 +4138,6 @@ class Model(Domain):
                     'positive': 'up'
                     },
                 'relative_humidity': {'long_name': 'Relative Humidity', 'units': '%'},
-                'SPQ': {'long_name': 'Specific Humidity', 'units': 'kg/kg'},
                 'long_wave': {'long_name': 'Long Wave Radiation', 'units': 'W m-2'},
                 'short_wave': {'long_name': 'Short Wave Radiation', 'units': 'W m-2'},
                 'cloud_cover': {'long_name': 'Cloud Area Fraction', 'units': 'cloud covered fraction of sky [0,1]'},
@@ -4157,10 +4156,9 @@ class Model(Domain):
             }
             for attr in atts:
                 if attr in elemdata:
-                    loc = {'location': 'nele'}
+                    atts[attr] = atts[attr] | template | {'location': 'nele'}
                 else:
-                    loc = {'location': 'node'}
-                atts[attr] = atts[attr] | template | loc
+                    atts[attr] = atts[attr] | template | {'location': 'node'}
 
             # Loop over all attributes and add variables to the netCDF file
             for attr in atts:
@@ -4169,7 +4167,8 @@ class Model(Domain):
                 for attribute in atts[attr]:
                     setattr(var, attribute, atts[attr][attribute])
     
-    def write_to_nc(self, outfile, fvcom_name, interp_data):
+    @staticmethod
+    def _write_atmosphere_to_nc(outfile, fvcom_name, interp_data):
         '''
         Write interpolated data to the netCDF forcing file
         '''
