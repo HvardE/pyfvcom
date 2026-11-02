@@ -5188,7 +5188,7 @@ class RegularReader(FileReader):
         else:
             raise AttributeError('Unrecognised latitude dimension name')
 
-        depthname, depthvar, depthdim, depth_compare = self._get_depth_dim()
+        _, _, _, depth_compare = self._get_depth_dim()
 
         lon_compare = xdim == getattr(other.dims, xname)
         lat_compare = ydim == getattr(other.dims, yname)
@@ -5735,7 +5735,7 @@ class NEMOReader(RegularReader):
         else:
             raise AttributeError('Unrecognised latitude dimension name')
 
-        depthname, depthvar, depthdim, depth_compare = self._get_depth_dim()
+        _, _, _, depth_compare = self._get_depth_dim()
 
         lon_compare = xdim == getattr(other.dims, xname)
         lat_compare = ydim == getattr(other.dims, yname)
